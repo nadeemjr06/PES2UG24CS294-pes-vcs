@@ -1,8 +1,21 @@
 // index.c — Staging area implementation
+//
+// Text format of .pes/index (one entry per line, sorted by path):
+//
+//   <mode-octal> <64-char-hex-hash> <mtime-seconds> <size> <path>
+//
+// Example:
+//   100644 a1b2c3d4e5f6...  1699900000 42 README.md
+//   100644 f7e8d9c0b1a2...  1699900100 128 src/main.c
+//
+// This is intentionally a simple text format. No magic numbers, no
+// binary parsing. The focus is on the staging area CONCEPT (tracking
+// what will go into the next commit) and ATOMIC WRITES (temp+rename).
+//
+// PROVIDED functions: index_find, index_remove, index_status
+// TODO functions:     index_load, index_save, index_add
 
 #include "index.h"
-#include "pes.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +26,7 @@
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
+// Find an index entry by path (linear scan).
 IndexEntry* index_find(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0)
@@ -21,13 +35,14 @@ IndexEntry* index_find(Index *index, const char *path) {
     return NULL;
 }
 
+// Remove a file from the index.
+// Returns 0 on success, -1 if path not in index.
 int index_remove(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0) {
             int remaining = index->count - i - 1;
             if (remaining > 0)
-                memmove(&index->entries[i],
-                        &index->entries[i + 1],
+                memmove(&index->entries[i], &index->entries[i + 1],
                         remaining * sizeof(IndexEntry));
             index->count--;
             return index_save(index);
@@ -37,10 +52,16 @@ int index_remove(Index *index, const char *path) {
     return -1;
 }
 
+// Print the status of the working directory.
+//
+// Identifies files that are staged, unstaged (modified/deleted in working dir),
+// and untracked (present in working dir but not in index).
+// Returns 0.
 int index_status(const Index *index) {
     printf("Staged changes:\n");
     int staged_count = 0;
-
+    // Note: A true Git implementation deeply diffs against the HEAD tree here. 
+    // For this lab, displaying indexed files represents the staging intent.
     for (int i = 0; i < index->count; i++) {
         printf("  staged:     %s\n", index->entries[i].path);
         staged_count++;
@@ -50,15 +71,14 @@ int index_status(const Index *index) {
 
     printf("Unstaged changes:\n");
     int unstaged_count = 0;
-
     for (int i = 0; i < index->count; i++) {
         struct stat st;
         if (stat(index->entries[i].path, &st) != 0) {
             printf("  deleted:    %s\n", index->entries[i].path);
             unstaged_count++;
         } else {
-            if (st.st_mtime != (time_t)index->entries[i].mtime_sec ||
-                st.st_size  != (off_t)index->entries[i].size) {
+            // Fast diff: check metadata instead of re-hashing file content
+            if (st.st_mtime != (time_t)index->entries[i].mtime_sec || st.st_size != (off_t)index->entries[i].size) {
                 printf("  modified:   %s\n", index->entries[i].path);
                 unstaged_count++;
             }
@@ -69,30 +89,29 @@ int index_status(const Index *index) {
 
     printf("Untracked files:\n");
     int untracked_count = 0;
-
     DIR *dir = opendir(".");
     if (dir) {
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
-
-            if (strcmp(ent->d_name, ".") == 0 ||
-                strcmp(ent->d_name, "..") == 0) continue;
-
+            // Skip hidden directories, parent directories, and build artifacts
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
             if (strcmp(ent->d_name, ".pes") == 0) continue;
-            if (strcmp(ent->d_name, "pes") == 0) continue;
-            if (strstr(ent->d_name, ".o") != NULL) continue;
+            if (strcmp(ent->d_name, "pes") == 0) continue; // compiled executable
+            if (strstr(ent->d_name, ".o") != NULL) continue; // object files
 
-            int tracked = 0;
+            // Check if file is tracked in the index
+            int is_tracked = 0;
             for (int i = 0; i < index->count; i++) {
                 if (strcmp(index->entries[i].path, ent->d_name) == 0) {
-                    tracked = 1;
+                    is_tracked = 1; 
                     break;
                 }
             }
-
-            if (!tracked) {
+            
+            if (!is_tracked) {
                 struct stat st;
-                if (stat(ent->d_name, &st) == 0 && S_ISREG(st.st_mode)) {
+                stat(ent->d_name, &st);
+                if (S_ISREG(st.st_mode)) { // Only list regular files for simplicity
                     printf("  untracked:  %s\n", ent->d_name);
                     untracked_count++;
                 }
@@ -100,187 +119,144 @@ int index_status(const Index *index) {
         }
         closedir(dir);
     }
-
     if (untracked_count == 0) printf("  (nothing to show)\n");
     printf("\n");
 
     return 0;
 }
 
-// ─── IMPLEMENTED FUNCTIONS ───────────────────────────────────────────────────
+// ─── TODO: Implement these ───────────────────────────────────────────────────
 
-// Load index
+// Load the index from .pes/index.
+//
+// HINTS - Useful functions:
+//   - fopen (with "r"), fscanf, fclose : reading the text file line by line
+//   - hex_to_hash                      : converting the parsed string to ObjectID
+//
+// Returns 0 on success, -1 on error.
 int index_load(Index *index) {
+    FILE *fp = fopen(".pes/index", "r");
+
+    if (!fp) {
+        index->count = 0;
+        return 0;
+    }
+
     index->count = 0;
 
-    FILE *fp = fopen(".pes/index", "r");
-    if (!fp) {
-        return 0; // no index yet
-    }
+    while (1) {
+        IndexEntry e;
+        char hash_hex[65];
 
-    char hash_hex[65];
+        int ret = fscanf(fp, "%o %64s %lu %u %[^\n]\n",
+            &e.mode,
+            hash_hex,
+            &e.mtime_sec,
+            &e.size,
+            e.path
+        );
 
-    while (index->count < MAX_INDEX_ENTRIES) {
-        IndexEntry *e = &index->entries[index->count];
+        if (ret != 5) break;
 
-        int ret = fscanf(fp, "%o %64s %lu %u %511[^\n]\n",
-                         &e->mode,
-                         hash_hex,
-                         &e->mtime_sec,
-                         &e->size,
-                         e->path);
+        hex_to_hash(hash_hex, &e.hash);
 
-        if (ret == EOF) break;
-
-        if (ret != 5) {
-            fclose(fp);
-            fprintf(stderr, "error: malformed index\n");
-            return -1;
-        }
-
-        if (hex_to_hash(hash_hex, &e->hash) != 0) {
-            fclose(fp);
-            fprintf(stderr, "error: invalid hash\n");
-            return -1;
-        }
-
-        index->count++;
+        index->entries[index->count++] = e;
     }
 
     fclose(fp);
     return 0;
 }
-
-// Sort helper
-static int compare_entries(const void *a, const void *b) {
-    return strcmp(((IndexEntry *)a)->path,
-                  ((IndexEntry *)b)->path);
-}
-
-// Save index (atomic)
+// Save the index to .pes/index atomically.
+//
+// HINTS - Useful functions and syscalls:
+//   - qsort                            : sorting the entries array by path
+//   - fopen (with "w"), fprintf        : writing to the temporary file
+//   - hash_to_hex                      : converting ObjectID for text output
+//   - fflush, fileno, fsync, fclose    : flushing userspace buffers and syncing to disk
+//   - rename                           : atomically moving the temp file over the old index
+//
+// Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    Index temp = *index;
-
-    qsort(temp.entries, temp.count,
-          sizeof(IndexEntry), compare_entries);
-
     FILE *fp = fopen(".pes/index.tmp", "w");
-    if (!fp) {
-        perror("fopen");
-        return -1;
-    }
+    if (!fp) return -1;
 
-    char hash_hex[65];
+    for (int i = 0; i < index->count; i++) {
+        const IndexEntry *e = &index->entries[i];
 
-    for (int i = 0; i < temp.count; i++) {
-        const IndexEntry *e = &temp.entries[i];
-
-        hash_to_hex(&e->hash, hash_hex);
+        char hex[65];
+        hash_to_hex(&e->hash, hex);
 
         fprintf(fp, "%o %s %lu %u %s\n",
-                e->mode,
-                hash_hex,
-                e->mtime_sec,
-                e->size,
-                e->path);
-    }
-
-    fflush(fp);
-
-    int fd = fileno(fp);
-    if (fsync(fd) != 0) {
-        perror("fsync");
-        fclose(fp);
-        return -1;
+            e->mode,
+            hex,
+            e->mtime_sec,
+            e->size,
+            e->path
+        );
     }
 
     fclose(fp);
-
-    if (rename(".pes/index.tmp", ".pes/index") != 0) {
-        perror("rename");
-        return -1;
-    }
+    rename(".pes/index.tmp", ".pes/index");
 
     return 0;
 }
-
-// Add (stage file)
+// Stage a file for the next commit.
+//
+// HINTS - Useful functions and syscalls:
+//   - fopen, fread, fclose             : reading the target file's contents
+//   - object_write                     : saving the contents as OBJ_BLOB
+//   - stat / lstat                     : getting file metadata (size, mtime, mode)
+//   - index_find                       : checking if the file is already staged
+//
+// Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-
-    // 🔥 FIX 1: Ensure index is initialized
-    if (index->count < 0 || index->count > MAX_INDEX_ENTRIES) {
-        if (index_load(index) != 0) {
-            fprintf(stderr, "error: failed to load index\n");
-            return -1;
-        }
-    }
-
     struct stat st;
-    if (stat(path, &st) != 0) {
-        perror("stat");
-        return -1;
-    }
-
-    if (!S_ISREG(st.st_mode)) {
-        fprintf(stderr, "error: '%s' is not a file\n", path);
-        return -1;
-    }
+    if (stat(path, &st) != 0) return -1;
 
     FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        perror("fopen");
-        return -1;
-    }
+    if (!fp) return -1;
 
-    // 🔥 FIX 2: safe malloc for empty files
-    size_t size = st.st_size;
-    void *buf = malloc(size ? size : 1);
-    if (!buf) {
-        fclose(fp);
-        return -1;
-    }
+    fseek(fp, 0, SEEK_END);
+    long size = ftell(fp);
+    rewind(fp);
 
-    // 🔥 FIX 3: safe fread
-    if (size > 0 &&
-        fread(buf, 1, size, fp) != size) {
-        perror("fread");
-        free(buf);
-        fclose(fp);
-        return -1;
-    }
+    void *data = malloc(size);
+    if (!data) return -1;
 
+    fread(data, 1, size, fp);
     fclose(fp);
 
-    ObjectID hash;
-    if (object_write(OBJ_BLOB, buf, size, &hash) != 0) {
-        free(buf);
+    ObjectID oid;
+    if (object_write(OBJ_BLOB, data, size, &oid) != 0) {
+        free(data);
         return -1;
     }
 
-    free(buf);
+    free(data);
 
-    // 🔥 FIX 4: safe index_find (prevent garbage count usage)
-    IndexEntry *entry = NULL;
+    // check if already exists
+    for (int i = 0; i < index->count; i++) {
+        if (strcmp(index->entries[i].path, path) == 0) {
+            index->entries[i].hash = oid;
+            index->entries[i].mtime_sec = st.st_mtime;
+            index->entries[i].size = size;
 
-    if (index->count >= 0 && index->count <= MAX_INDEX_ENTRIES) {
-        entry = index_find(index, path);
-    }
-
-    if (!entry) {
-        if (index->count < 0 || index->count >= MAX_INDEX_ENTRIES) {
-            fprintf(stderr, "error: index corrupted\n");
-            return -1;
+            index_save(index);   
+            return 0;
         }
-        entry = &index->entries[index->count++];
     }
 
-    entry->mode = st.st_mode;
-    entry->hash = hash;
-    entry->mtime_sec = st.st_mtime;
-    entry->size = st.st_size;
+    // add new entry
+    IndexEntry *e = &index->entries[index->count++];
 
-    strncpy(entry->path, path, sizeof(entry->path) - 1);
-    entry->path[sizeof(entry->path) - 1] = '\0';
+    e->mode = 0100644;
+    e->hash = oid;
+    e->mtime_sec = st.st_mtime;
+    e->size = size;
+    strcpy(e->path, path);
 
-    return index_save(index);
+    
+    if (index_save(index) != 0) return -1;
+
+    return 0;
 }
