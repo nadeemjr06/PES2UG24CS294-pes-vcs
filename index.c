@@ -210,6 +210,8 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
+    if (!index || !path) return -1;
+
     struct stat st;
     if (stat(path, &st) != 0) return -1;
 
@@ -220,10 +222,26 @@ int index_add(Index *index, const char *path) {
     long size = ftell(fp);
     rewind(fp);
 
-    void *data = malloc(size);
-    if (!data) return -1;
+    if (size < 0) {
+        fclose(fp);
+        return -1;
+    }
 
-    fread(data, 1, size, fp);
+    void *data = NULL;
+    if (size > 0) {
+        data = malloc(size);
+        if (!data) {
+            fclose(fp);
+            return -1;
+        }
+
+        if (fread(data, 1, size, fp) != (size_t)size) {
+            free(data);
+            fclose(fp);
+            return -1;
+        }
+    }
+
     fclose(fp);
 
     ObjectID oid;
@@ -234,29 +252,34 @@ int index_add(Index *index, const char *path) {
 
     free(data);
 
-    // check if already exists
+    // update existing
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0) {
             index->entries[i].hash = oid;
             index->entries[i].mtime_sec = st.st_mtime;
             index->entries[i].size = size;
-
-            index_save(index);   
-            return 0;
+            return index_save(index);
         }
     }
 
-    // add new entry
-    IndexEntry *e = &index->entries[index->count++];
+    // prevent overflow (VERY IMPORTANT)
+    if (index->count >= MAX_INDEX_ENTRIES) {
+        fprintf(stderr, "index full\n");
+        return -1;
+    }
+
+    IndexEntry *e = &index->entries[index->count];
 
     e->mode = 0100644;
     e->hash = oid;
     e->mtime_sec = st.st_mtime;
     e->size = size;
-    strcpy(e->path, path);
 
-    
-    if (index_save(index) != 0) return -1;
+    // SAFE COPY
+    strncpy(e->path, path, sizeof(e->path) - 1);
+    e->path[sizeof(e->path) - 1] = '\0';
 
-    return 0;
+    index->count++;
+
+    return index_save(index);
 }
