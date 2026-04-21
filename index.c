@@ -1,7 +1,7 @@
 // index.c — Staging area implementation
 
 #include "index.h"
-#include "object.h"
+#include "pes.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +13,6 @@
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
-// Find an index entry by path (linear scan).
 IndexEntry* index_find(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0)
@@ -22,7 +21,6 @@ IndexEntry* index_find(Index *index, const char *path) {
     return NULL;
 }
 
-// Remove a file from the index.
 int index_remove(Index *index, const char *path) {
     for (int i = 0; i < index->count; i++) {
         if (strcmp(index->entries[i].path, path) == 0) {
@@ -39,7 +37,6 @@ int index_remove(Index *index, const char *path) {
     return -1;
 }
 
-// Print working directory status
 int index_status(const Index *index) {
     printf("Staged changes:\n");
     int staged_count = 0;
@@ -77,6 +74,7 @@ int index_status(const Index *index) {
     if (dir) {
         struct dirent *ent;
         while ((ent = readdir(dir)) != NULL) {
+
             if (strcmp(ent->d_name, ".") == 0 ||
                 strcmp(ent->d_name, "..") == 0) continue;
 
@@ -94,8 +92,7 @@ int index_status(const Index *index) {
 
             if (!tracked) {
                 struct stat st;
-                stat(ent->d_name, &st);
-                if (S_ISREG(st.st_mode)) {
+                if (stat(ent->d_name, &st) == 0 && S_ISREG(st.st_mode)) {
                     printf("  untracked:  %s\n", ent->d_name);
                     untracked_count++;
                 }
@@ -112,13 +109,13 @@ int index_status(const Index *index) {
 
 // ─── IMPLEMENTED FUNCTIONS ───────────────────────────────────────────────────
 
-// Load index from .pes/index
+// Load index
 int index_load(Index *index) {
     index->count = 0;
 
     FILE *fp = fopen(".pes/index", "r");
     if (!fp) {
-        return 0; // no index yet → empty
+        return 0; // no index yet
     }
 
     char hash_hex[65];
@@ -134,6 +131,7 @@ int index_load(Index *index) {
                          e->path);
 
         if (ret == EOF) break;
+
         if (ret != 5) {
             fclose(fp);
             fprintf(stderr, "error: malformed index\n");
@@ -153,13 +151,13 @@ int index_load(Index *index) {
     return 0;
 }
 
-// Comparator for sorting
+// Sort helper
 static int compare_entries(const void *a, const void *b) {
     return strcmp(((IndexEntry *)a)->path,
                   ((IndexEntry *)b)->path);
 }
 
-// Save index atomically
+// Save index (atomic)
 int index_save(const Index *index) {
     Index temp = *index;
 
@@ -206,7 +204,7 @@ int index_save(const Index *index) {
     return 0;
 }
 
-// Stage a file
+// Add (stage file)
 int index_add(Index *index, const char *path) {
     struct stat st;
     if (stat(path, &st) != 0) {
