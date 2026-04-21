@@ -98,7 +98,7 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 
 // Forward declarations
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
-int index_load(Index *index, const char *path);
+int index_load(Index *index);
 
 static int write_tree_level(IndexEntry **entries, int count, const char *prefix, ObjectID *id_out) {
     Tree tree;
@@ -158,7 +158,7 @@ static int write_tree_level(IndexEntry **entries, int count, const char *prefix,
 
 int tree_from_index(ObjectID *id_out) {
     Index index;
-    if (index_load(&index, INDEX_FILE) != 0)
+    if (index_load(&index) != 0)
         return -1;
 
     if (index.count == 0) {
