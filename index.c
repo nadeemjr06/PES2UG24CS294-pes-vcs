@@ -206,6 +206,15 @@ int index_save(const Index *index) {
 
 // Add (stage file)
 int index_add(Index *index, const char *path) {
+
+    // 🔥 FIX 1: Ensure index is initialized
+    if (index->count < 0 || index->count > MAX_INDEX_ENTRIES) {
+        if (index_load(index) != 0) {
+            fprintf(stderr, "error: failed to load index\n");
+            return -1;
+        }
+    }
+
     struct stat st;
     if (stat(path, &st) != 0) {
         perror("stat");
@@ -223,13 +232,17 @@ int index_add(Index *index, const char *path) {
         return -1;
     }
 
-    void *buf = malloc(st.st_size);
+    // 🔥 FIX 2: safe malloc for empty files
+    size_t size = st.st_size;
+    void *buf = malloc(size ? size : 1);
     if (!buf) {
         fclose(fp);
         return -1;
     }
 
-    if (fread(buf, 1, st.st_size, fp) != (size_t)st.st_size) {
+    // 🔥 FIX 3: safe fread
+    if (size > 0 &&
+        fread(buf, 1, size, fp) != size) {
         perror("fread");
         free(buf);
         fclose(fp);
@@ -239,18 +252,23 @@ int index_add(Index *index, const char *path) {
     fclose(fp);
 
     ObjectID hash;
-    if (object_write(OBJ_BLOB, buf, st.st_size, &hash) != 0) {
+    if (object_write(OBJ_BLOB, buf, size, &hash) != 0) {
         free(buf);
         return -1;
     }
 
     free(buf);
 
-    IndexEntry *entry = index_find(index, path);
+    // 🔥 FIX 4: safe index_find (prevent garbage count usage)
+    IndexEntry *entry = NULL;
+
+    if (index->count >= 0 && index->count <= MAX_INDEX_ENTRIES) {
+        entry = index_find(index, path);
+    }
 
     if (!entry) {
-        if (index->count >= MAX_INDEX_ENTRIES) {
-            fprintf(stderr, "error: index full\n");
+        if (index->count < 0 || index->count >= MAX_INDEX_ENTRIES) {
+            fprintf(stderr, "error: index corrupted\n");
             return -1;
         }
         entry = &index->entries[index->count++];
