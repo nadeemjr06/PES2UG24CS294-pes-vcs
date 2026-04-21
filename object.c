@@ -1,5 +1,5 @@
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // Step 1: Build the header string e.g. "blob 16\0"
+    // Step 1: Build header string e.g. "blob 16\0"
     const char *type_str;
     if      (type == OBJ_BLOB)   type_str = "blob";
     else if (type == OBJ_TREE)   type_str = "tree";
@@ -7,58 +7,60 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     else return -1;
 
     char header[64];
+    // snprintf does NOT include the null terminator in the count
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
-    header_len += 1; // include the '\0' terminator in the header
+    header_len += 1; // +1 to include the '\0' as part of the header
 
     // Step 2: Combine header + data into one buffer
-    size_t total_len = header_len + len;
+    size_t total_len = (size_t)header_len + len;
     uint8_t *full_object = malloc(total_len);
     if (!full_object) return -1;
 
-    memcpy(full_object, header, header_len);       // copy "blob 16\0"
-    memcpy(full_object + header_len, data, len);   // copy actual data
+    memcpy(full_object, header, header_len);
+    memcpy(full_object + header_len, data, len);
 
     // Step 3: Compute SHA-256 of the full object
     compute_hash(full_object, total_len, id_out);
 
-    // Step 4: Deduplication — if it already exists, we're done
+    // Step 4: Deduplication
     if (object_exists(id_out)) {
         free(full_object);
         return 0;
     }
 
-    // Step 5: Build the shard dir path e.g. ".pes/objects/2f/"
+    // Step 5: Build shard directory path e.g. ".pes/objects/2f"
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
 
     char shard_dir[512];
     snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
-    mkdir(shard_dir, 0755); // create shard dir (ignore error if already exists)
+    mkdir(shard_dir, 0755);
 
-    // Step 6: Build final path and temp path
-    char final_path[512];
-    snprintf(final_path, sizeof(final_path), "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
-
+    // Step 6: Build temp path — use a fixed suffix, not mkstemp
     char temp_path[512];
-    snprintf(temp_path, sizeof(temp_path), "%s/%.2s/tmp_XXXXXX", OBJECTS_DIR, hex);
+    snprintf(temp_path, sizeof(temp_path), "%s/%.2s/tmp_%s", OBJECTS_DIR, hex, hex + 2);
 
-    // Step 7: Write to temp file first (atomic write pattern)
-    int fd = mkstemp(temp_path); // creates a unique temp file
+    // Step 7: Open temp file and write
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         free(full_object);
         return -1;
     }
 
-    ssize_t written = write(fd, full_object, total_len);
+    size_t written = 0;
+    while (written < total_len) {
+        ssize_t n = write(fd, full_object + written, total_len - written);
+        if (n < 0) {
+            close(fd);
+            unlink(temp_path);
+            free(full_object);
+            return -1;
+        }
+        written += n;
+    }
     free(full_object);
 
-    if (written != (ssize_t)total_len) {
-        close(fd);
-        unlink(temp_path);
-        return -1;
-    }
-
-    // Step 8: fsync the temp file — ensure data is on disk before rename
+    // Step 8: fsync temp file
     if (fsync(fd) < 0) {
         close(fd);
         unlink(temp_path);
@@ -66,13 +68,16 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     }
     close(fd);
 
-    // Step 9: Atomically rename temp -> final path
+    // Step 9: Build final path and atomically rename
+    char final_path[512];
+    snprintf(final_path, sizeof(final_path), "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
+
     if (rename(temp_path, final_path) < 0) {
         unlink(temp_path);
         return -1;
     }
 
-    // Step 10: fsync the shard directory to persist the rename
+    // Step 10: fsync the shard directory
     int dir_fd = open(shard_dir, O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
