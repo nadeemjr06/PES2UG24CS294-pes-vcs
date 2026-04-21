@@ -1,5 +1,58 @@
+cat > object.c << 'EOF'
+// object.c — Content-addressable object store
+
+#include "pes.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <openssl/evp.h>
+
+// ─── PROVIDED ────────────────────────────────────────────────────────────────
+
+void hash_to_hex(const ObjectID *id, char *hex_out) {
+    for (int i = 0; i < HASH_SIZE; i++) {
+        sprintf(hex_out + i * 2, "%02x", id->hash[i]);
+    }
+    hex_out[HASH_HEX_SIZE] = '\0';
+}
+
+int hex_to_hash(const char *hex, ObjectID *id_out) {
+    if (strlen(hex) < HASH_HEX_SIZE) return -1;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        unsigned int byte;
+        if (sscanf(hex + i * 2, "%2x", &byte) != 1) return -1;
+        id_out->hash[i] = (uint8_t)byte;
+    }
+    return 0;
+}
+
+void compute_hash(const void *data, size_t len, ObjectID *id_out) {
+    unsigned int hash_len;
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+    EVP_DigestUpdate(ctx, data, len);
+    EVP_DigestFinal_ex(ctx, id_out->hash, &hash_len);
+    EVP_MD_CTX_free(ctx);
+}
+
+void object_path(const ObjectID *id, char *path_out, size_t path_size) {
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(id, hex);
+    snprintf(path_out, path_size, "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
+}
+
+int object_exists(const ObjectID *id) {
+    char path[512];
+    object_path(id, path, sizeof(path));
+    return access(path, F_OK) == 0;
+}
+
+// ─── TODO: Implemented ───────────────────────────────────────────────────────
+
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // Step 1: Build header string e.g. "blob 16\0"
     const char *type_str;
     if      (type == OBJ_BLOB)   type_str = "blob";
     else if (type == OBJ_TREE)   type_str = "tree";
@@ -7,11 +60,9 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     else return -1;
 
     char header[64];
-    // snprintf does NOT include the null terminator in the count
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
-    header_len += 1; // +1 to include the '\0' as part of the header
+    header_len += 1;
 
-    // Step 2: Combine header + data into one buffer
     size_t total_len = (size_t)header_len + len;
     uint8_t *full_object = malloc(total_len);
     if (!full_object) return -1;
@@ -19,16 +70,13 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     memcpy(full_object, header, header_len);
     memcpy(full_object + header_len, data, len);
 
-    // Step 3: Compute SHA-256 of the full object
     compute_hash(full_object, total_len, id_out);
 
-    // Step 4: Deduplication
     if (object_exists(id_out)) {
         free(full_object);
         return 0;
     }
 
-    // Step 5: Build shard directory path e.g. ".pes/objects/2f"
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
 
@@ -36,11 +84,9 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     snprintf(shard_dir, sizeof(shard_dir), "%s/%.2s", OBJECTS_DIR, hex);
     mkdir(shard_dir, 0755);
 
-    // Step 6: Build temp path — use a fixed suffix, not mkstemp
     char temp_path[512];
     snprintf(temp_path, sizeof(temp_path), "%s/%.2s/tmp_%s", OBJECTS_DIR, hex, hex + 2);
 
-    // Step 7: Open temp file and write
     int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) {
         free(full_object);
@@ -60,7 +106,6 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     }
     free(full_object);
 
-    // Step 8: fsync temp file
     if (fsync(fd) < 0) {
         close(fd);
         unlink(temp_path);
@@ -68,7 +113,6 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     }
     close(fd);
 
-    // Step 9: Build final path and atomically rename
     char final_path[512];
     snprintf(final_path, sizeof(final_path), "%s/%.2s/%s", OBJECTS_DIR, hex, hex + 2);
 
@@ -77,7 +121,6 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
         return -1;
     }
 
-    // Step 10: fsync the shard directory
     int dir_fd = open(shard_dir, O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
@@ -87,13 +130,10 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     return 0;
 }
 
-
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // Step 1: Get the file path from the hash
     char path[512];
     object_path(id, path, sizeof(path));
 
-    // Step 2: Open and read the entire file into memory
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -119,22 +159,19 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     }
     fclose(f);
 
-    // Step 3: Integrity check — re-hash the file contents
     ObjectID computed;
     compute_hash(raw, file_size, &computed);
     if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
         free(raw);
-        return -1; // corrupted object
+        return -1;
     }
 
-    // Step 4: Parse the header — find the '\0' separating header from data
     uint8_t *null_pos = memchr(raw, '\0', file_size);
     if (!null_pos) {
         free(raw);
         return -1;
     }
 
-    // Step 5: Parse type string ("blob", "tree", or "commit")
     if      (strncmp((char *)raw, "blob",   4) == 0) *type_out = OBJ_BLOB;
     else if (strncmp((char *)raw, "tree",   4) == 0) *type_out = OBJ_TREE;
     else if (strncmp((char *)raw, "commit", 6) == 0) *type_out = OBJ_COMMIT;
@@ -143,7 +180,6 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
         return -1;
     }
 
-    // Step 6: Extract the data portion (everything after the '\0')
     uint8_t *data_start = null_pos + 1;
     size_t data_len = file_size - (data_start - raw);
 
@@ -160,3 +196,4 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     free(raw);
     return 0;
 }
+EOF
